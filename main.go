@@ -5,6 +5,7 @@ import (
 	"io"
 	"io/ioutil"
 	"net"
+	"sync"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,15 +14,17 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-type  Mode int
+var sshkeyLoadLocker = sync.Mutex{}
 
 const (
 	sshPortEnv     = "SSH_PORT"
 	defaultSshPort = "22"
 	serverIP       = "0.0.0.0"
-	keyPath        = "ssh/my_rsa"
+	keyPath        = "ssh/id_rsa"
 	RepoRootPath   = "myrepo"
 )
+
+type  Mode int
 
 const (
 	MODE_READ = iota  
@@ -48,21 +51,33 @@ func getlistenaddress() (string, string) {
     return listenaddress, port
 }
 
+func createKeygroup(keyPath string) {
+	if _, err := os.Stat(keyPath); err != nil {
+		os.MkdirAll(filepath.Dir(keyPath), os.ModePerm)
+	    if err := exec.Command("ssh-keygen", "-f", keyPath, "-t", "rsa", "-N", "").Run(); err != nil {
+			panic(fmt.Sprintf("SSH: Fail to generate private key: %v\r\n", err))
+		}
+		fmt.Printf("SSH: New private key is generateed: %s\r\n", keyPath)
+	}
+}
+
+func createRepopath(repoPath string) {
+	if _, err := os.Stat(repoPath); err != nil {
+		if err := os.MkdirAll(repoPath, os.ModePerm); err != nil {
+			panic(fmt.Sprintf("SSH: Fail to generate repo path: %v\r\n", err))
+		}
+		fmt.Printf("SSH: New repo path is generateed: %s\r\n", repoPath)
+	}
+}
+
 func main() {
 	config := &ssh.ServerConfig{
 		NoClientAuth: true,
 	}
 
-	generatekey(keyPath)
-	privateBytes, err := ioutil.ReadFile(keyPath)
-	if err != nil {
-		panic("SSH: Fail to load private key\r\n")
-	}
-	private, err := ssh.ParsePrivateKey(privateBytes)
-	if err != nil {
-		panic("SSH: Fail to parse private key\r\n")
-	}
-	config.AddHostKey(private)
+	createKeygroup(keyPath)
+	createRepopath(RepoRootPath)
+    generateKey(keyPath, config)
 
     address, port := getlistenaddress()
 	listener, err := net.Listen("tcp", address)
@@ -77,23 +92,11 @@ func main() {
 			fmt.Printf("SSH: Error accepting incoming connection: %v\r\n", err)
 			continue
 		}
-		go handlerConn(nConn, config)
+		go handleConn(nConn, config)
 	}
 }
 
-func generatekey(keyPath string)  {
-	if _, err := os.Stat(keyPath); err != nil {
-		os.MkdirAll(filepath.Dir(keyPath), os.ModePerm)
-	    if err := exec.Command("ssh-keygen", "-f", keyPath, "-t", "rsa", "-N", "").Run(); err != nil {
-//		_, stderr, err := com.ExecCmd("ssh-keygen", "-f", keyPath, "-t", "rsa", "-N", "")
-//		if err != nil {
-			panic(fmt.Sprintf("SSH: Fail to generate private key: %v\r\n", err))
-		}
-		fmt.Printf("SSH: New private key is generateed: %s\r\n", keyPath)
-	}
-}
-
-func handlerConn(conn net.Conn, config *ssh.ServerConfig) {
+func handleConn(conn net.Conn, config *ssh.ServerConfig) {
 	fmt.Printf("SSH: Handshaking for %s\r\n", conn.RemoteAddr())
 	sConn, chans, reqs, err := ssh.NewServerConn(conn, config)
 	if err != nil {
@@ -128,8 +131,8 @@ func handlerConn(conn net.Conn, config *ssh.ServerConfig) {
 					payload := string(req.Payload)
 					i := strings.Index(payload, "git")
 					if i == -1 {
-						panic(fmt.Sprintf("SSH: %s is not a git command\r\n", req.Payload))
-						return
+						fmt.Sprintf("SSH: %s is invalidate, only support git command!\r\n", payload)
+						continue
 					}
 	                cmd := payload[i:]           
                     handleGitcmd(cmd, req, channel)
@@ -150,9 +153,6 @@ func handleGitcmd(cmd string, req *ssh.Request, channel ssh.Channel) {
 
 	gitcmd := generateGitcmd(verb, args)
 	gitcmd.Dir = RepoRootPath
-
-	fmt.Fprintln(os.Stderr, "Gogs RepoRootPath:", RepoRootPath)
-	fmt.Fprintln(os.Stderr, "Gogs gitcmd:", gitcmd)
 
 	gitcmdStart(gitcmd, req, channel)
 	channel.SendRequest("exit-status", false, []byte{0, 0, 0, 0})
@@ -212,4 +212,44 @@ func gitcmdStart(gitcmd *exec.Cmd, req *ssh.Request, channel ssh.Channel) {
 		fmt.Fprintln(os.Stderr, "SSH: Wait: %v", err)
 		return
 	}
+}
+
+// generateKey add hostkey and pubkey
+func generateKey(keyPath string, config *ssh.ServerConfig) {
+	privateBytes, err := ioutil.ReadFile(keyPath)
+	if err != nil {
+		panic("SSH: Fail to load private key\r\n")
+	}
+	private, err := ssh.ParsePrivateKey(privateBytes)
+	if err != nil {
+		panic("SSH: Fail to parse private key\r\n")
+	}
+	config.AddHostKey(private)
+
+    saveAuthorizedKeyFile(keyPath)
+}
+
+// saveAuthorizedKeyFile writes SSH pubkey content to authorized_keys file.
+func saveAuthorizedKeyFile(keyPath string) error {
+	sshkeyLoadLocker.Lock()
+	defer sshkeyLoadLocker.Unlock()
+
+	fpath := fmt.Sprintf("/%s/%s/%s", "root", ".ssh", "authorized_keys")
+	_, err := os.Stat(fpath)
+	if err != nil {
+        if _, err := os.Create(fpath); err != nil {
+        	panic(fmt.Sprintf("SSH: Fail to Create authorized_keys: %v\r\n", err))
+        }
+	    fmt.Printf("SSH: New authorized_keys is generated: %s\r\n", fpath)
+	}
+
+    pubkeypath := fmt.Sprintf("%s%s", keyPath, ".pub")
+	if _, err := os.Stat(pubkeypath); err == nil {
+		content, _ := ioutil.ReadFile(pubkeypath)
+		if err := ioutil.WriteFile(fpath, content, 0700); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
