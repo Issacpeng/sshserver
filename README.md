@@ -1,12 +1,12 @@
 # Plumbing - A key/value engine for Git backend storage
 
-Plumbing is a key/value engine for Git backend storage, can simply accepts data from git command, and loads git backend storage lib to storage data in key/value db such as `redis` etc.
+Plumbing is a key/value engine for Git backend storage, can simply accepts data from git client and store repo data in db such as `redis` etc.
 
 ## How it works
 
-* Plumbing starts intelligent git server process and listening on default SSH protocol port:22.
+* Plumbing receive data by SSH protocal and listening on default SSH port `22`.
 * Plumbing loads git backend storage lib to store data.
-* Plumbing receives a git request, when you add a git commit and push it to origin repo, can loads git backend storage lib to store in the currect localtion in key/value db. when you clone from origin repo, can find currect data and back to local path.
+* plumbing receives a git request and auto starts intelligent git server process, you add a git commit and push it to origin repo, it can store in the currect localtion by key/value type. when you clone from origin repo, it can find currect repo data and send it back.
 
 ## Usage
 
@@ -24,10 +24,10 @@ $ go get && go build
 $ ./plumbing
 # copy private key to your own local path
 $ cp -f ssh/id_rsa ~/.ssh
+```
 
-
-###test example for plumbing
-
+###pull and push testing example for plumbing
+```bash
 # create a empty repo on server 
 $ mkdir -p myrepo/testuser/testreponame.git
 $ cd myrepo/testuser/testreponame.git
