@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -11,47 +10,50 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/Unknwon/com"
 	"golang.org/x/crypto/ssh"
 )
 
-const (
-	NoClientAuth = iota
-	PublicKeyAuth
-)
+type  Mode int
 
 const (
 	sshPortEnv     = "SSH_PORT"
 	defaultSshPort = "22"
+	serverIP       = "0.0.0.0"
 	keyPath        = "ssh/my_rsa"
 	RepoRootPath   = "myrepo"
 )
 
-func generatekey(keyPath string) {
-	if !com.IsExist(keyPath) {
-		os.MkdirAll(filepath.Dir(keyPath), os.ModePerm)
-		_, stderr, err := com.ExecCmd("ssh-keygen", "-f", keyPath, "-t", "rsa", "-N", "")
-		if err != nil {
-			panic(fmt.Sprintf("SSH: Fail to generate private key: %v - %s\r\n", err, stderr))
-		}
-		fmt.Printf("SSH: New private key is generateed: %s\r\n", keyPath)
-	}
-}
+const (
+	MODE_READ = iota  
+	MODE_WRITE        
+)
 
-func main() {
+var (
+	validateCommands = map[string]Mode{
+		"git-upload-pack":    MODE_READ,
+		"git-upload-archive": MODE_READ,
+		"git-receive-pack":   MODE_WRITE,
+	}
+)
+
+func getlistenaddress() (string, string) {
 	port := os.Getenv(sshPortEnv)
 	if port == "" {
 		port = defaultSshPort
-	} else {
+	} else { 
 		port = fmt.Sprintf("%s", port)
 	}
 
+    listenaddress := fmt.Sprintf("%s:%s", serverIP, port)
+    return listenaddress, port
+}
+
+func main() {
 	config := &ssh.ServerConfig{
 		NoClientAuth: true,
 	}
 
 	generatekey(keyPath)
-
 	privateBytes, err := ioutil.ReadFile(keyPath)
 	if err != nil {
 		panic("SSH: Fail to load private key\r\n")
@@ -62,10 +64,8 @@ func main() {
 	}
 	config.AddHostKey(private)
 
-	dl := NewDealDemo()
-	go dl.Run()
-
-	listener, err := net.Listen("tcp", "0.0.0.0:"+port)
+    address, port := getlistenaddress()
+	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		panic("SSH: failed to listen for connection\r\n")
 	}
@@ -77,19 +77,23 @@ func main() {
 			fmt.Printf("SSH: Error accepting incoming connection: %v\r\n", err)
 			continue
 		}
-		go handlerConn(nConn, dl, config)
+		go handlerConn(nConn, config)
 	}
 }
 
-func cleanCommand(cmd string) string {
-	i := strings.Index(cmd, "git")
-	if i == -1 {
-		return cmd
+func generatekey(keyPath string)  {
+	if _, err := os.Stat(keyPath); err != nil {
+		os.MkdirAll(filepath.Dir(keyPath), os.ModePerm)
+	    if err := exec.Command("ssh-keygen", "-f", keyPath, "-t", "rsa", "-N", "").Run(); err != nil {
+//		_, stderr, err := com.ExecCmd("ssh-keygen", "-f", keyPath, "-t", "rsa", "-N", "")
+//		if err != nil {
+			panic(fmt.Sprintf("SSH: Fail to generate private key: %v\r\n", err))
+		}
+		fmt.Printf("SSH: New private key is generateed: %s\r\n", keyPath)
 	}
-	return cmd[i:]
 }
 
-func handlerConn(conn net.Conn, dl *DealDemo, config *ssh.ServerConfig) {
+func handlerConn(conn net.Conn, config *ssh.ServerConfig) {
 	fmt.Printf("SSH: Handshaking for %s\r\n", conn.RemoteAddr())
 	sConn, chans, reqs, err := ssh.NewServerConn(conn, config)
 	if err != nil {
@@ -115,35 +119,20 @@ func handlerConn(conn net.Conn, dl *DealDemo, config *ssh.ServerConfig) {
 			fmt.Println("SSH: could not accept channel.\r\n")
 			return
 		}
-
+        
 		go func(in <-chan *ssh.Request) {
 			defer channel.Close()
 			for req := range in {
-				payload := cleanCommand(string(req.Payload))
 				switch req.Type {
-				case "env":
-					args := strings.Split(strings.Replace(payload, "\x00", "", -1), "\v")
-					if len(args) != 2 {
-						fmt.Fprintln(os.Stderr, "SSH: Invalid env arguments: '%#v'\r\n", args)
-						continue
-					}
-					args[0] = strings.TrimLeft(args[0], "\x04")
-					_, _, err := com.ExecCmdBytes("env", args[0]+"="+args[1])
-					if err != nil {
-						fmt.Fprintln(os.Stderr, "SSH: env: %v\r\n", err)
+				case "exec":
+					payload := string(req.Payload)
+					i := strings.Index(payload, "git")
+					if i == -1 {
+						panic(fmt.Sprintf("SSH: %s is not a git command\r\n", req.Payload))
 						return
 					}
-				case "exec":
-					cmd := strings.TrimLeft(payload, "'()")
-					gitcmd := genteatecmd(cmd)
-					gitcmd.Dir = RepoRootPath
-
-					fmt.Fprintln(os.Stderr, "Gogs RepoRootPath:", RepoRootPath)
-					fmt.Fprintln(os.Stderr, "Gogs gitcmd.Dir:", gitcmd.Dir)
-					fmt.Fprintln(os.Stderr, "Gogs gitcmd:", gitcmd)
-
-					cmdstart(gitcmd, req, channel)
-					channel.SendRequest("exit-status", false, []byte{0, 0, 0, 0})
+	                cmd := payload[i:]           
+                    handleGitcmd(cmd, req, channel)
 					return
 				}
 			}
@@ -151,12 +140,38 @@ func handlerConn(conn net.Conn, dl *DealDemo, config *ssh.ServerConfig) {
 	}
 }
 
-func genteatecmd(cmd string) *exec.Cmd {
-	verb, args := parseCmd(cmd)
+func handleGitcmd(cmd string, req *ssh.Request, channel ssh.Channel) {
+    verb, args := parseGitcmd(cmd)
+	_, has := validateCommands[verb]
+	if !has {
+		panic(fmt.Sprintf("SSH: Unknown git command %s\r\n", verb))
+		return
+	}
+
+	gitcmd := generateGitcmd(verb, args)
+	gitcmd.Dir = RepoRootPath
+
+	fmt.Fprintln(os.Stderr, "Gogs RepoRootPath:", RepoRootPath)
+	fmt.Fprintln(os.Stderr, "Gogs gitcmd:", gitcmd)
+
+	gitcmdStart(gitcmd, req, channel)
+	channel.SendRequest("exit-status", false, []byte{0, 0, 0, 0})
+}
+
+func parseGitcmd(cmd string) (string, string) {
+	cmdleft := strings.TrimLeft(cmd, "'()")
+	cmdsplit := strings.SplitN(cmdleft, " ", 2)
+	if len(cmdsplit) != 2 {
+		return "", ""
+	}
+	return cmdsplit[0], strings.Replace(cmdsplit[1], "'/", "'", 1)
+}
+
+func generateGitcmd(verb string, args string) *exec.Cmd {
 	repoPath := strings.ToLower(strings.Trim(args, "'"))
+	verbs := strings.Split(verb, " ")
 
 	var gitcmd *exec.Cmd
-	verbs := strings.Split(verb, " ")
 	if len(verbs) == 2 {
 		gitcmd = exec.Command(verbs[0], verbs[1], repoPath)
 	} else {
@@ -166,7 +181,7 @@ func genteatecmd(cmd string) *exec.Cmd {
 	return gitcmd
 }
 
-func cmdstart(gitcmd *exec.Cmd, req *ssh.Request, channel ssh.Channel) {
+func gitcmdStart(gitcmd *exec.Cmd, req *ssh.Request, channel ssh.Channel) {
 	stdout, err := gitcmd.StdoutPipe()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "SSH: StdoutPipe: %v", err)
@@ -196,35 +211,5 @@ func cmdstart(gitcmd *exec.Cmd, req *ssh.Request, channel ssh.Channel) {
 	if err = gitcmd.Wait(); err != nil {
 		fmt.Fprintln(os.Stderr, "SSH: Wait: %v", err)
 		return
-	}
-}
-
-func parseCmd(cmd string) (string, string) {
-	ss := strings.SplitN(cmd, " ", 2)
-	if len(ss) != 2 {
-		return "", ""
-	}
-	return ss[0], strings.Replace(ss[1], "'/", "'", 1)
-}
-
-type DealDemo struct {
-	HandleChannel chan ssh.Channel
-}
-
-func NewDealDemo() *DealDemo {
-	return &DealDemo{
-		HandleChannel: make(chan ssh.Channel),
-	}
-}
-
-func (dl *DealDemo) Run() {
-	for {
-		select {
-		case c := <-dl.HandleChannel:
-			go func() {
-				reader := bufio.NewReader(c)
-				fmt.Printf("SSH: reader:%v\r\n", reader)
-			}()
-		}
 	}
 }
